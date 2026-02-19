@@ -18,7 +18,7 @@ TASKSETS_ROOT="${1:-./tasksets}"
 OUTPUT_DIR="${2:-./results}"
 JOBS="${3:-$(nproc)}"
 SIMULATOR="$(pwd)/phase2_simulator.py"
-UPDATE_INTERVAL=50.0
+UPDATE_INTERVAL=1.0
 
 mkdir -p "$OUTPUT_DIR"
 

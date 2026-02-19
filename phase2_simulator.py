@@ -66,7 +66,7 @@ class BayesianLambdaEstimator:
 # Simulation
 # ---------------------------------------------------------------------------
 def simulate(run_data: Dict[str, Any], algo: str,
-             update_interval: float = 50.0) -> Dict[str, Any]:
+             update_interval: float = 1.0) -> Dict[str, Any]:
 
     params = run_data['parameters']
     M = params['M']
@@ -330,7 +330,7 @@ def simulate(run_data: Dict[str, Any], algo: str,
 # Aggregate over a directory of JSON files
 # ---------------------------------------------------------------------------
 def run_directory(directory: str, algo: str,
-                  update_interval: float = 50.0) -> Dict[str, Any]:
+                  update_interval: float = 1.0) -> Dict[str, Any]:
     files = sorted(glob.glob(os.path.join(directory, 'run_*.json')))
     if not files:
         raise FileNotFoundError(f"No run_*.json files in {directory}")
@@ -392,8 +392,8 @@ def main():
                         help='Directory with run_*.json files')
     parser.add_argument('--algo', default='all',
                         choices=['bayesian', 'static_high', 'static_base', 'all'])
-    parser.add_argument('--update_interval', type=float, default=50.0,
-                        help='Bayesian update window (default: 50)')
+    parser.add_argument('--update_interval', type=float, default=1,
+                        help='Bayesian update window (default: 1)')
     parser.add_argument('--out', default=None,
                         help='Output JSON path (default: stdout)')
     args = parser.parse_args()
