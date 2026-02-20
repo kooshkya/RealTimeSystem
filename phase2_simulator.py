@@ -57,7 +57,7 @@ class GroupLambdaEstimator:
 
     @property
     def lambda_est(self) -> float:
-        return tasksets_run001_onlyself.a / self.b
+        return self.a / self.b
 
     @property
     def wcet_mean(self) -> float:
