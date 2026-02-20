@@ -84,29 +84,39 @@ def generate_periodic_tasks(n: int, U_total: float) -> list[dict]:
 # ---------------------------------------------------------------------------
 # 2. Aperiodic task generation (Poisson arrivals)
 # ---------------------------------------------------------------------------
-
-def generate_aperiodic_tasks(n_a: int, sim_duration: float,
+def generate_aperiodic_tasks(n_groups: int, sim_duration: float,
                               lam: float = APERIODIC_LAMBDA) -> list[dict]:
     """
-    Generate n_a aperiodic tasks with Poisson inter-arrival times.
-    Execution times: uniform [1, 10]; relative deadlines: uniform [C, 3*C].
+    Generate aperiodic task instances from n_groups independent Poisson processes,
+    each with arrival rate `lam`, running over [0, sim_duration].
+    Each instance is tagged with its group ID (e.g., 'A0', 'A1', ...).
+    Returns all instances sorted by arrival time, with unique instance IDs.
     """
-    tasks = []
-    arrival = 0.0
-    for i in range(n_a):
-        inter = random.expovariate(lam)          # Exp(λ) ↔ Poisson process
-        arrival += inter
-        C = random.randint(1, 10)
-        D = random.randint(C, 3 * C)
-        tasks.append({
-            "id": f"A{i}",
-            "type": "aperiodic",
-            "arrival_time": round(arrival, 4),
-            "wcet": C,
-            "deadline": D,
-            "abs_deadline": round(arrival + D, 4),
-        })
-    return tasks
+    all_tasks = []
+    for g in range(n_groups):
+        arrival = 0.0
+        instance = 0
+        while True:
+            inter = random.expovariate(lam)
+            arrival += inter
+            if arrival > sim_duration:
+                break
+            C = random.randint(1, 10)
+            D = random.randint(C, 3 * C)
+            all_tasks.append({
+                "id": f"A{g}_{instance}",   # group_instance
+                "group": f"A{g}",            # which aperiodic task type
+                "type": "aperiodic",
+                "arrival_time": round(arrival, 4),
+                "wcet": C,
+                "deadline": D,
+                "abs_deadline": round(arrival + D, 4),
+            })
+            instance += 1
+
+    # Sort all instances by arrival time
+    all_tasks.sort(key=lambda t: t["arrival_time"])
+    return all_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +291,8 @@ def build_taskset(M: int, periodic_mult: int, aperiodic_mult: int,
             "periodic_mult": periodic_mult,
             "aperiodic_mult": aperiodic_mult,
             "n_periodic": n_p,
-            "n_aperiodic": n_a,
+            "n_aperiodic_groups": n_a,         
+            "n_aperiodic_instances": len(aperiodic_tasks), 
             "util_coeff": util_coeff,
             "U_total": round(U_total, 6),
             "sim_duration": sim_duration,
