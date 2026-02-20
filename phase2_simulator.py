@@ -3,7 +3,7 @@
 Phase 2 Simulator — Adaptive Power Management for Real-Time Multi-Core Systems
 
 Three scheduling algorithms:
-  1. bayesian    — Gamma-Poisson online inference of lambda; adjusts alpha per core
+  1. bayesian    — Per-group Gamma-Poisson lambda; allocates entire group to one core
   2. static_high — alpha = 1.0 always
   3. static_base — alpha = alpha_base always
 
@@ -16,7 +16,6 @@ import json
 import math
 import os
 import glob
-from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
 
@@ -34,32 +33,60 @@ def energy_rate(alpha: float) -> float:
 DEFAULT_ALPHA_LEVELS = [round(0.1 * i, 1) for i in range(2, 11)]
 
 
-def select_alpha(alpha_base: float, lambda_est: float,
-                 ap_wcet_mean: float, alpha_levels: List[float]) -> float:
-    """Pick lowest alpha >= alpha_base + lambda_est * ap_wcet_mean."""
-    required = alpha_base + lambda_est * ap_wcet_mean
-    for a in sorted(alpha_levels):
-        if a >= required - 1e-9:
-            return a
-    return max(alpha_levels)
-
-
 # ---------------------------------------------------------------------------
-# Bayesian Gamma-Poisson estimator
+# Per-group Bayesian estimator
 # ---------------------------------------------------------------------------
-class BayesianLambdaEstimator:
+class GroupLambdaEstimator:
+    """Gamma-Poisson conjugate for one aperiodic group."""
     def __init__(self, a: float = 1.0, b: float = 10.0):
         self.a = a   # shape
         self.b = b   # rate
+        self.wcet_sum = 0.0
+        self.wcet_count = 0
+
+    def observe_arrival(self, wcet: float):
+        """Called when a task from this group arrives."""
+        self.wcet_sum += wcet
+        self.wcet_count += 1
 
     def update(self, count: int, window: float):
+        """Bayesian update at end of window."""
         if window > 0:
             self.a += count
             self.b += window
 
     @property
-    def mean(self) -> float:
+    def lambda_est(self) -> float:
         return self.a / self.b
+
+    @property
+    def wcet_mean(self) -> float:
+        if self.wcet_count == 0:
+            return 5.0  # prior: midpoint of [1,10]
+        return self.wcet_sum / self.wcet_count
+
+
+# ---------------------------------------------------------------------------
+# Lightweight EDF schedulability check
+# ---------------------------------------------------------------------------
+def compute_min_alpha_edf(tasks: List[Dict], alpha_levels: List[float]) -> float:
+    """
+    Find minimum alpha such that sum(C_i / (alpha * T_i)) <= 1.
+    tasks = [{'wcet': ..., 'period': ...}, ...]
+    Returns: lowest alpha in alpha_levels satisfying the constraint.
+    """
+    if not tasks:
+        return min(alpha_levels)
+    
+    # U_total = sum(C_i / T_i)
+    U_total = sum(t['wcet'] / t['period'] for t in tasks)
+    # We need: U_total / alpha <= 1  =>  alpha >= U_total
+    required_alpha = U_total
+    
+    for a in sorted(alpha_levels):
+        if a >= required_alpha - 1e-9:
+            return a
+    return max(alpha_levels)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +105,6 @@ def simulate(run_data: Dict[str, Any], algo: str,
     periodic_by_id = {t['id']: t for t in run_data['periodic_tasks']}
 
     # Build core structures
-    # core_mapping keys are strings "0", "1", ...
     core_mapping = run_data['core_mapping']
     cores = []
     for core_id_str, cdata in core_mapping.items():
@@ -92,9 +118,8 @@ def simulate(run_data: Dict[str, Any], algo: str,
                 'period': float(t['period']),
                 'wcet': float(t['wcet']),
                 'deadline': float(t['deadline']),
-                # simulation state
                 'next_release': 0.0,
-                'abs_deadline': float(t['deadline']),  # first deadline
+                'abs_deadline': float(t['deadline']),
                 'remaining': 0.0,
                 'in_queue': False,
             })
@@ -103,7 +128,9 @@ def simulate(run_data: Dict[str, Any], algo: str,
             'alpha_base': alpha_base,
             'alpha': alpha_base,
             'tasks': tasks,
-            'periodic_queue': [],   # list of task dicts ready to run
+            # Virtual periodic tasks for aperiodic groups
+            'virtual_tasks': [],  # [{'group': 'A0', 'period': 1/lambda, 'wcet': C_mean}]
+            'periodic_queue': [],
             'current_periodic': None,
             'remaining_periodic': 0.0,
             'aperiodic_queue': [],
@@ -112,13 +139,13 @@ def simulate(run_data: Dict[str, Any], algo: str,
             'energy': 0.0,
         })
 
-    # Sort cores by id
     cores.sort(key=lambda c: c['id'])
 
-    # Aperiodic tasks pool (pre-generated, sorted by arrival)
+    # Aperiodic tasks pool
     ap_pool = sorted([
         {
             'id': t['id'],
+            'group': t['group'],
             'arrival': float(t['arrival_time']),
             'wcet': float(t['wcet']),
             'rel_deadline': float(t['deadline']),
@@ -131,51 +158,113 @@ def simulate(run_data: Dict[str, Any], algo: str,
         if float(t['arrival_time']) < T_sim
     ], key=lambda x: x['arrival'])
 
-    ap_wcet_mean = (sum(t['wcet'] for t in ap_pool) / len(ap_pool)) if ap_pool else 1.0
+    # Per-group estimators (shared across cores)
+    group_estimators = {}  # {group_id: GroupLambdaEstimator}
+    group_to_core = {}     # {group_id: core_id}
+
+    # Bayesian update tracking
+    window_start = 0.0
+    window_arrivals = {}  # {group_id: count}
+    next_update = update_interval
+
+    def allocate_group_to_core(group_id: str):
+        """Allocate entire group to the emptiest core (by total utilization including virtual tasks)."""
+        def core_utilization(c):
+            U_periodic = sum(t['wcet'] / t['period'] for t in c['tasks'])
+            U_virtual = sum(vt['wcet'] / vt['period'] for vt in c['virtual_tasks'])
+            return U_periodic + U_virtual
+        
+        best = min(cores, key=core_utilization)
+        group_to_core[group_id] = best['id']
+        
+        # Create virtual periodic task for this group
+        estimator = group_estimators[group_id]
+        period = 1.0 / estimator.lambda_est if estimator.lambda_est > 1e-9 else 1e6
+        wcet = estimator.wcet_mean
+        
+        best['virtual_tasks'].append({
+            'group': group_id,
+            'period': period,
+            'wcet': wcet,
+        })
+        
+        # Recompute alpha for this core
+        if algo == 'bayesian':
+            all_tasks = [
+                {'wcet': t['wcet'], 'period': t['period']} for t in best['tasks']
+            ] + [
+                {'wcet': vt['wcet'], 'period': vt['period']} for vt in best['virtual_tasks']
+            ]
+            best['alpha'] = compute_min_alpha_edf(all_tasks, alpha_levels)
+
+    def update_group_virtual_task(group_id: str):
+        """Update the virtual task parameters for a group and recompute core alpha."""
+        core_id = group_to_core.get(group_id)
+        if core_id is None:
+            return
+        
+        core = next(c for c in cores if c['id'] == core_id)
+        estimator = group_estimators[group_id]
+        
+        # Find and update the virtual task
+        for vt in core['virtual_tasks']:
+            if vt['group'] == group_id:
+                vt['period'] = 1.0 / estimator.lambda_est if estimator.lambda_est > 1e-9 else 1e6
+                vt['wcet'] = estimator.wcet_mean
+                break
+        
+        # Recompute alpha
+        if algo == 'bayesian':
+            all_tasks = [
+                {'wcet': t['wcet'], 'period': t['period']} for t in core['tasks']
+            ] + [
+                {'wcet': vt['wcet'], 'period': vt['period']} for vt in core['virtual_tasks']
+            ]
+            core['alpha'] = compute_min_alpha_edf(all_tasks, alpha_levels)
+
+    def route_aperiodic(ap):
+        """Route aperiodic to its group's assigned core."""
+        group_id = ap['group']
+        
+        # Initialize estimator if first task from this group
+        if group_id not in group_estimators:
+            group_estimators[group_id] = GroupLambdaEstimator(a=1.0, b=10.0)
+            window_arrivals[group_id] = 0
+        
+        estimator = group_estimators[group_id]
+        estimator.observe_arrival(ap['wcet'])
+        window_arrivals[group_id] += 1
+        
+        # Allocate group to core if first arrival
+        if group_id not in group_to_core:
+            allocate_group_to_core(group_id)
+        
+        # Route to assigned core
+        core_id = group_to_core[group_id]
+        core = cores[core_id]  # Direct indexing since core['id'] == list index
+        ap['assigned_core'] = core_id
+        core['aperiodic_queue'].append(ap)
 
     # Set initial alpha
-    def set_alphas(lambda_est=None):
-        for c in cores:
-            if algo == 'static_high':
-                c['alpha'] = 1.0
-            elif algo == 'static_base':
-                c['alpha'] = c['alpha_base']
-            elif algo == 'bayesian' and lambda_est is not None:
-                c['alpha'] = select_alpha(c['alpha_base'], lambda_est, ap_wcet_mean, alpha_levels)
-            else:
-                c['alpha'] = c['alpha_base']
-
-    set_alphas()
-
-    # Route aperiodic to least-loaded core (by periodic utilization)
-    def route_aperiodic(ap):
-        best = min(cores, key=lambda c: sum(
-            t['wcet'] / t['period'] for t in c['tasks']
-        ))
-        ap['assigned_core'] = best['id']
-        best['aperiodic_queue'].append(ap)
+    for c in cores:
+        if algo == 'static_high':
+            c['alpha'] = 1.0
+        elif algo == 'static_base':
+            c['alpha'] = c['alpha_base']
+        else:
+            c['alpha'] = c['alpha_base']
 
     # Metrics
     total_energy = 0.0
     alpha_samples = []
     util_samples = []
-
-    # Periodic miss tracking
     periodic_deadlines_total = 0
     periodic_deadlines_missed = 0
-
-    # Aperiodic tracking
     ap_total = len(ap_pool)
-    ap_arrived = 0  # how many have actually arrived
+    ap_arrived = 0
     ap_completed = 0
     ap_missed = 0
-
-    # Bayesian
-    bayes = BayesianLambdaEstimator(a=1.0, b=10.0)
     lambda_errors = []
-    window_start = 0.0
-    window_arrivals = 0
-    next_update = update_interval
 
     ap_index = 0
     dt = 0.1
@@ -188,17 +277,22 @@ def simulate(run_data: Dict[str, Any], algo: str,
             ap = ap_pool[ap_index]
             ap_arrived += 1
             route_aperiodic(ap)
-            window_arrivals += 1
             ap_index += 1
 
-        # --- Bayesian update ---
+        # --- Bayesian update (per group) ---
         if algo == 'bayesian' and t >= next_update - 1e-9:
             window_len = t - window_start
-            bayes.update(window_arrivals, window_len)
-            lambda_est = bayes.mean
-            lambda_errors.append(abs(lambda_est - true_lambda))
-            set_alphas(lambda_est)
-            window_arrivals = 0
+            for group_id, estimator in group_estimators.items():
+                count = window_arrivals.get(group_id, 0)
+                estimator.update(count, window_len)
+                window_arrivals[group_id] = 0
+                
+                # Update virtual task and recompute alpha
+                update_group_virtual_task(group_id)
+                
+                # Track lambda error
+                lambda_errors.append(abs(estimator.lambda_est - true_lambda))
+            
             window_start = t
             next_update += update_interval
 
@@ -212,11 +306,9 @@ def simulate(run_data: Dict[str, Any], algo: str,
             # Release periodic tasks
             for pt in c['tasks']:
                 if abs(pt['next_release'] - t) < dt / 2.0:
-                    # Check if previous instance missed deadline
-                    # (if it was never completed — tracked via remaining)
                     c['periodic_queue'].append(pt)
                     pt['next_release'] += pt['period']
-                    pt['abs_deadline'] = pt['next_release']  # deadline = next release
+                    pt['abs_deadline'] = pt['next_release']
                     periodic_deadlines_total += 1
 
             # EDF sort
@@ -303,25 +395,26 @@ def simulate(run_data: Dict[str, Any], algo: str,
     miss_rate = ap_missed / ap_total if ap_total > 0 else 0.0
     periodic_miss_rate = periodic_deadlines_missed / periodic_deadlines_total if periodic_deadlines_total > 0 else 0.0
 
+    # Aggregate lambda estimate
+    lambda_est_final = None
+    if group_estimators:
+        lambda_est_final = sum(e.lambda_est for e in group_estimators.values()) / len(group_estimators)
+
     return {
         'energy_total': total_energy,
         'energy_per_core': [c['energy'] for c in cores],
-        # Aperiodic metrics
         'ap_total': ap_total,
         'ap_arrived': ap_arrived,
         'ap_completed': ap_completed,
         'ap_missed': ap_missed,
         'ap_miss_rate': miss_rate,
-        # Periodic metrics
         'periodic_deadlines_total': periodic_deadlines_total,
         'periodic_deadlines_missed': periodic_deadlines_missed,
         'periodic_miss_rate': periodic_miss_rate,
-        # Alpha / util
         'alpha_mean': sum(alpha_samples) / len(alpha_samples) if alpha_samples else 0.0,
         'util_mean': sum(util_samples) / len(util_samples) if util_samples else 0.0,
-        # Bayesian
         'lambda_true': true_lambda,
-        'lambda_est_final': bayes.mean if algo == 'bayesian' else None,
+        'lambda_est_final': lambda_est_final,
         'lambda_est_error_mean': (sum(lambda_errors) / len(lambda_errors)) if lambda_errors else None,
     }
 
@@ -359,7 +452,6 @@ def run_directory(directory: str, algo: str,
         'algorithm': algo,
         'directory': directory,
         'num_runs': len(results),
-        # Config
         'M': p['M'],
         'n_periodic': p['n_periodic'],
         'n_aperiodic_groups': p['n_aperiodic_groups'],
@@ -367,7 +459,6 @@ def run_directory(directory: str, algo: str,
         'U_total': p['U_total'],
         'sim_duration': p['sim_duration'],
         'lambda_true': p['aperiodic_lambda'],
-        # Averaged metrics
         'energy_total_mean': avg('energy_total'),
         'ap_total_mean': avg('ap_total'),
         'ap_arrived_mean': avg('ap_arrived'),
