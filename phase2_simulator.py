@@ -57,7 +57,7 @@ class GroupLambdaEstimator:
 
     @property
     def lambda_est(self) -> float:
-        return self.a / self.b
+        return tasksets_run001_onlyself.a / self.b
 
     @property
     def wcet_mean(self) -> float:
@@ -325,13 +325,14 @@ def simulate(run_data: Dict[str, Any], algo: str,
                 pt = c['periodic_queue'][0]
                 if c['current_periodic'] is not pt:
                     c['current_periodic'] = pt
-                    c['remaining_periodic'] = pt['wcet'] / alpha
+                    c['remaining_periodic'] = pt['wcet']
                     c['periodic_queue'].pop(0)
 
-                exec_t = min(c['remaining_periodic'], remaining_dt)
-                c['remaining_periodic'] -= exec_t
-                remaining_dt -= exec_t
-                time_used += exec_t
+                exec_work = min(c['remaining_periodic'], alpha * remaining_dt)
+                c['remaining_periodic'] -= exec_work
+                exec_time = exec_work / alpha
+                remaining_dt -= exec_time
+                time_used += exec_time
 
                 if c['remaining_periodic'] <= 1e-9:
                     c['current_periodic'] = None
@@ -351,13 +352,14 @@ def simulate(run_data: Dict[str, Any], algo: str,
                 ap = c['aperiodic_queue'][0]
                 if c['current_aperiodic'] is not ap:
                     c['current_aperiodic'] = ap
-                    c['remaining_aperiodic'] = ap['wcet'] / alpha
+                    c['remaining_aperiodic'] = ap['wcet']
                     c['aperiodic_queue'].pop(0)
 
-                exec_t = min(c['remaining_aperiodic'], remaining_dt)
-                c['remaining_aperiodic'] -= exec_t
-                remaining_dt -= exec_t
-                time_used += exec_t
+                exec_work = min(c['remaining_aperiodic'], alpha * remaining_dt)
+                c['remaining_aperiodic'] -= exec_work
+                exec_time = exec_work / alpha
+                remaining_dt -= exec_time
+                time_used += exec_time
 
                 if c['remaining_aperiodic'] <= 1e-9:
                     c['current_aperiodic']['completed'] = True
@@ -394,7 +396,7 @@ def simulate(run_data: Dict[str, Any], algo: str,
 
     miss_rate = ap_missed / ap_total if ap_total > 0 else 0.0
     periodic_miss_rate = periodic_deadlines_missed / periodic_deadlines_total if periodic_deadlines_total > 0 else 0.0
-
+    
     # Aggregate lambda estimate
     lambda_est_final = None
     if group_estimators:
