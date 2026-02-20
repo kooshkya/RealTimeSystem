@@ -303,7 +303,7 @@ def run_directory(directory, algo, update_interval=1.0):
     results = []
     for f in files:
         with open(f) as fh:
-            run_data = json.load(f)
+            run_data = json.load(fh)
         results.append(simulate(run_data, algo, update_interval))
 
     def avg(k):
